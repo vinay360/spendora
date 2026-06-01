@@ -29,6 +29,8 @@ import {
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
+import { normalizeExpenseDate } from "@/lib/date-normalizer"
+import { createCategoryFromChat } from "@/server/actions/categories"
 import type { ExpenseChatUIMessage } from "@/server/ai/expense-chat-agent"
 
 type CategoryOption = {
@@ -38,6 +40,7 @@ type CategoryOption = {
 
 type ExpenseDraft = {
   amount: string
+  createCategory: boolean
   description: string
   occurredAt: string
   currency: string
@@ -64,12 +67,13 @@ function ExpenseConfirmationDialog({
     { type: "tool-requestExpenseConfirmation" }
   >
   categories: CategoryOption[]
-  onConfirm: (toolCallId: string, draft: ExpenseDraft) => void
+  onConfirm: (toolCallId: string, draft: ExpenseDraft) => Promise<void>
   onCancel: (toolCallId: string) => void
 }) {
-  const today = new Date().toISOString().slice(0, 10)
+  const today = normalizeExpenseDate("today") ?? new Date().toISOString().slice(0, 10)
   const initialDraft = useMemo<ExpenseDraft>(() => {
     const input = part.state === "input-available" ? part.input : undefined
+    const normalizedOccurredAt = normalizeExpenseDate(input?.occurredAt)
     const matchedCategory = input?.categoryName
       ? categories.find(
         (category) =>
@@ -79,8 +83,9 @@ function ExpenseConfirmationDialog({
 
     return {
       amount: input?.amount ? String(input.amount) : "",
+      createCategory: Boolean(input?.categoryName && !matchedCategory),
       description: input?.description ?? "",
-      occurredAt: input?.occurredAt?.slice(0, 10) ?? today,
+      occurredAt: normalizedOccurredAt ?? (input?.occurredAt ? "" : today),
       currency: input?.currency ?? "USD",
       merchant: input?.merchant ?? "",
       categoryId: input?.categoryId ?? matchedCategory?.id ?? "",
@@ -88,6 +93,9 @@ function ExpenseConfirmationDialog({
     }
   }, [categories, part, today])
   const [draft, setDraft] = useState(initialDraft)
+  const [submitError, setSubmitError] = useState<string>()
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const canCreateCategory = Boolean(draft.categoryName.trim() && !draft.categoryId)
   const isComplete =
     Number(draft.amount) > 0 && draft.description.trim().length >= 2 && draft.occurredAt
 
@@ -218,6 +226,7 @@ function ExpenseConfirmationDialog({
                 setDraft((current) => ({
                   ...current,
                   categoryId: event.target.value,
+                  createCategory: false,
                   categoryName:
                     categories.find(
                       (category) => category.id === event.target.value
@@ -234,18 +243,75 @@ function ExpenseConfirmationDialog({
               ))}
             </select>
           </Field>
+          <Field>
+            <FieldLabel htmlFor={`${part.toolCallId}-new-category`}>
+              New category
+            </FieldLabel>
+            <Input
+              id={`${part.toolCallId}-new-category`}
+              maxLength={48}
+              minLength={2}
+              onChange={(event) =>
+                setDraft((current) => ({
+                  ...current,
+                  categoryId: "",
+                  categoryName: event.target.value,
+                  createCategory: event.target.value.trim().length >= 2,
+                }))
+              }
+              placeholder="Create a category from this chat"
+              value={draft.categoryId ? "" : draft.categoryName}
+            />
+          </Field>
+          {canCreateCategory ? (
+            <label
+              className="flex items-start gap-2 text-xs text-muted-foreground"
+              htmlFor={`${part.toolCallId}-create-category`}
+            >
+              <input
+                checked={draft.createCategory}
+                className="mt-0.5"
+                id={`${part.toolCallId}-create-category`}
+                onChange={(event) =>
+                  setDraft((current) => ({
+                    ...current,
+                    createCategory: event.target.checked,
+                  }))
+                }
+                type="checkbox"
+              />
+              Create &quot;{draft.categoryName.trim()}&quot; and assign this expense to
+              it when I approve.
+            </label>
+          ) : null}
         </FieldGroup>
+        {submitError ? (
+          <p className="text-xs text-destructive">{submitError}</p>
+        ) : null}
         <DialogFooter>
-          <Button onClick={() => onCancel(part.toolCallId)} variant="outline">
+          <Button
+            disabled={isSubmitting}
+            onClick={() => onCancel(part.toolCallId)}
+            variant="outline"
+          >
             <XIcon data-icon="inline-start" />
             Cancel
           </Button>
           <Button
-            disabled={!isComplete}
-            onClick={() => onConfirm(part.toolCallId, draft)}
+            disabled={!isComplete || isSubmitting}
+            onClick={async () => {
+              setIsSubmitting(true)
+              setSubmitError(undefined)
+              try {
+                await onConfirm(part.toolCallId, draft)
+              } catch {
+                setSubmitError("Could not create the category. Try again.")
+                setIsSubmitting(false)
+              }
+            }}
           >
             <CheckIcon data-icon="inline-start" />
-            Approve and save
+            {isSubmitting ? "Saving..." : "Approve and save"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -255,6 +321,7 @@ function ExpenseConfirmationDialog({
 
 export function ExpenseChat({ categories }: { categories: CategoryOption[] }) {
   const router = useRouter()
+  const [availableCategories, setAvailableCategories] = useState(categories)
   const [input, setInput] = useState("")
   const { addToolOutput, error, messages, sendMessage, status } =
     useChat<ExpenseChatUIMessage>({
@@ -263,7 +330,21 @@ export function ExpenseChat({ categories }: { categories: CategoryOption[] }) {
       onFinish: () => router.refresh(),
     })
 
-  function confirmExpense(toolCallId: string, draft: ExpenseDraft) {
+  async function confirmExpense(toolCallId: string, draft: ExpenseDraft) {
+    let categoryId = draft.categoryId || undefined
+    let categoryName = draft.categoryName.trim() || undefined
+
+    if (!categoryId && draft.createCategory && categoryName) {
+      const category = await createCategoryFromChat(categoryName)
+      categoryId = category.id
+      categoryName = category.name
+      setAvailableCategories((current) =>
+        current.some((item) => item.id === category.id)
+          ? current
+          : [...current, category]
+      )
+    }
+
     addToolOutput({
       tool: "requestExpenseConfirmation",
       toolCallId,
@@ -275,8 +356,8 @@ export function ExpenseChat({ categories }: { categories: CategoryOption[] }) {
           occurredAt: draft.occurredAt,
           currency: draft.currency.trim().toUpperCase(),
           merchant: draft.merchant.trim() || undefined,
-          categoryId: draft.categoryId || undefined,
-          categoryName: draft.categoryName || undefined,
+          categoryId,
+          categoryName,
         },
       },
     })
@@ -326,11 +407,10 @@ export function ExpenseChat({ categories }: { categories: CategoryOption[] }) {
                   <div className="mt-2 flex flex-col gap-2">
                     {message.parts.map((part) => {
                       if (part.type === "tool-requestExpenseConfirmation") {
-                        console.log(part.output)
                         return (
                           <ExpenseConfirmationDialog
-                            categories={categories}
-                            key={part.toolCallId}
+                            categories={availableCategories}
+                            key={`${part.toolCallId}-${part.state}`}
                             onCancel={cancelExpense}
                             onConfirm={confirmExpense}
                             part={part}

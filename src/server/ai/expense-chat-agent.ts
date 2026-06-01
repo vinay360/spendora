@@ -8,6 +8,7 @@ import { z } from "zod"
 
 import { db } from "@/db"
 import { categories, transactions } from "@/db/schema"
+import { normalizeExpenseDate } from "@/lib/date-normalizer"
 import { transactionSchema } from "@/lib/validations/finance"
 
 const confirmedExpenseSchema = z.object({
@@ -69,6 +70,7 @@ async function resolveCategoryId({
 }
 
 export function createExpenseChatAgent(userId: string) {
+  const today = normalizeExpenseDate("today") ?? new Date().toISOString().slice(0, 10)
   const tools = {
     listCategories: tool({
       description: "List the user's available expense categories.",
@@ -97,6 +99,7 @@ export function createExpenseChatAgent(userId: string) {
         "Save one approved expense after requestExpenseConfirmation returns approved=true with complete values.",
       inputSchema: confirmedExpenseSchema,
       execute: async (input) => {
+        const occurredAt = normalizeExpenseDate(input.occurredAt) ?? input.occurredAt
         const categoryId = await resolveCategoryId({
           userId,
           categoryId: input.categoryId,
@@ -108,7 +111,7 @@ export function createExpenseChatAgent(userId: string) {
           currency: input.currency,
           description: input.description,
           merchant: input.merchant,
-          occurredAt: input.occurredAt,
+          occurredAt,
           categoryId,
         })
 
@@ -177,7 +180,10 @@ You can help the user add and retrieve their own expenses.
 Rules:
 - Never save an expense until requestExpenseConfirmation has returned approved=true.
 - If the user wants to add an expense, extract the likely fields and call requestExpenseConfirmation, even if some fields are missing.
-- Treat today's date as ${new Date().toISOString().slice(0, 10)} when the user says today.
+- When calling requestExpenseConfirmation, include every expense field the user provided in the chat. Do not leave amount, description, merchant, date, currency, or category blank if the user stated it.
+- If the user names a category that may not exist, still pass categoryName to requestExpenseConfirmation so the user can create and confirm it in the same dialog.
+- Treat today's date as ${today} when the user says today.
+- Prefer ISO dates for occurredAt. If the user gives a relative or natural-language date, pass that exact phrase in occurredAt so the app can normalize it before confirmation.
 - Use USD unless the user gives another three-letter currency.
 - If confirmation is denied, do not save the expense. Ask what should change.
 - After confirmation is approved, call addExpense exactly once with the approved values.

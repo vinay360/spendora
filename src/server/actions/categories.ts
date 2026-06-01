@@ -47,6 +47,40 @@ export async function createCategory(formData: FormData) {
   revalidateCategoryViews()
 }
 
+export async function createCategoryFromChat(name: string) {
+  const user = await getCurrentUser()
+
+  if (!user) {
+    throw new Error("Unauthorized")
+  }
+
+  const input = categorySchema.parse({ name })
+  const userCategories = await db
+    .select({ id: categories.id, name: categories.name })
+    .from(categories)
+    .where(eq(categories.userId, user.id))
+  const existingCategory = userCategories.find(
+    (category) => category.name.toLowerCase() === input.name.toLowerCase()
+  )
+
+  if (existingCategory) {
+    return existingCategory
+  }
+
+  const category = { id: randomUUID(), name: input.name }
+
+  await db.insert(categories).values({
+    ...category,
+    userId: user.id,
+    icon: input.icon,
+    color: input.color,
+  })
+
+  revalidateCategoryViews()
+
+  return category
+}
+
 export async function updateCategory(formData: FormData) {
   const user = await getCurrentUser()
 
